@@ -1,0 +1,170 @@
+diff --git a/crates/horizon-client/src/game.rs b/crates/horizon-client/src/game.rs
+index 009d20be5..18c6dbc9b 100644
+--- a/crates/horizon-client/src/game.rs
++++ b/crates/horizon-client/src/game.rs
+@@ -231,6 +231,7 @@ mod native_components;
+ mod native_criteria;
+ mod native_data_maps;
+ mod native_entities;
++mod native_client_services;
+ mod native_entity_refs;
+ mod native_explosions;
+ mod native_falling;
+diff --git a/crates/horizon-client/src/game/native_client_services.rs b/crates/horizon-client/src/game/native_client_services.rs
+new file mode 100644
+index 000000000..a0144cd13
+--- /dev/null
++++ b/crates/horizon-client/src/game/native_client_services.rs
+@@ -0,0 +1,152 @@
++//! Client services for native mods, ported from upstream Horizon so mods written for it
++//! (worldmap) compile on Starling: the window's state, the entities the client knows,
++//! a mod's key bindings and a chat line sent for a mod.
++use super::Game;
++
++/// This window's state; unavailable on a server or before a window is attached.
++#[derive(Clone, Debug, Default)]
++#[non_exhaustive]
++pub struct NativeClientState {
++    pub window_id: u64,
++    pub focused: bool,
++    pub gui_hidden: bool,
++    pub gui_size: [f32; 2],
++    pub server_address: Option<String>,
++    pub logged_in: bool,
++    pub world_partial_tick: f64,
++    pub eye_position: Option<[f64; 3]>,
++    pub yaw: f32,
++    pub pitch: f32,
++    pub menu_blur: f32,
++}
++
++/// A living entity known to the client, before interpolation. No authoritative writes.
++#[derive(Clone, Debug, Default)]
++#[non_exhaustive]
++pub struct NativeClientEntity {
++    pub id: u32,
++    pub player_uuid: Option<u128>,
++    pub player_name: Option<String>,
++    pub position: [f64; 3],
++    pub previous_position: [f64; 3],
++    pub bounds: [[f64; 3]; 2],
++    pub height: f32,
++    pub head_yaw: f32,
++    pub head_pitch: f32,
++    pub alive: bool,
++    pub invisible: bool,
++}
++
++#[allow(dead_code)]
++impl Game<'_> {
++    /// Client/window/connection state, including when menus cover the world.
++    pub(super) fn native_client_state(&self) -> Option<NativeClientState> {
++        if !self.native_window() {
++            return None;
++        }
++        let (w, h) = self.gui_size();
++        Some(NativeClientState {
++            window_id: self.window.as_ref()?.id().into(),
++            focused: self.focused,
++            gui_hidden: self.ui.hide_gui,
++            gui_size: [w, h],
++            server_address: self.remote.as_ref().map(|r| r.session.address.clone()),
++            logged_in: self.remote.as_ref().is_some_and(|r| r.logged_in),
++            world_partial_tick: self.clock.fraction(),
++            eye_position: self.eye_position(),
++            yaw: self.yaw,
++            pitch: self.pitch,
++            menu_blur: self.settings.menu_blur as f32,
++        })
++    }
++
++    /// Bulk client render data. Unlike EntityRef, this snapshot expires independently of handles.
++    pub(super) fn native_client_entities(&self) -> Vec<NativeClientEntity> {
++        if !self.native_window() || self.remote.is_none() {
++            return Vec::new();
++        }
++        self.mobs
++            .iter()
++            .filter(|m| !m.removed)
++            .map(|m| {
++                let b = m.bounds();
++                let (lo, hi) = (b.min_position(), b.max_position());
++                NativeClientEntity {
++                    id: m.id,
++                    player_uuid: self.remote_player_uuid(m.id),
++                    player_name: self.remote_player_name(m.id).map(str::to_owned),
++                    position: [m.position.x, m.position.y, m.position.z],
++                    previous_position: [m.previous.x, m.previous.y, m.previous.z],
++                    bounds: [[lo.x, lo.y, lo.z], [hi.x, hi.y, hi.z]],
++                    height: m.height(),
++                    head_yaw: m.head_yaw,
++                    head_pitch: m.head_pitch,
++                    alive: m.alive(),
++                    invisible: m.invisible || m.has_effect("minecraft:invisibility"),
++                }
++            })
++            .collect()
++    }
++
++    /// Save a mod binding, or restore its default with None. No write when unchanged.
++    pub(super) fn native_set_mod_key(
++        &mut self,
++        mod_id: &str,
++        name: &str,
++        key: Option<&str>,
++    ) -> bool {
++        if !self.native_window()
++            || mod_id.is_empty()
++            || name.is_empty()
++            || mod_id.len() > 256
++            || name.len() > 256
++            || key.is_some_and(|k| k.len() > 512)
++        {
++            return false;
++        }
++        let old = self
++            .settings
++            .mods
++            .keys
++            .get(mod_id)
++            .and_then(|keys| keys.get(name))
++            .map(String::as_str);
++        if old == key {
++            return false;
++        }
++        if let Some(key) = key {
++            self.settings
++                .mods
++                .keys
++                .entry(mod_id.into())
++                .or_default()
++                .insert(name.into(), key.into());
++        } else if let Some(keys) = self.settings.mods.keys.get_mut(mod_id) {
++            keys.remove(name);
++        }
++        self.settings.save(&Self::options_path());
++        true
++    }
++
++    /// A mod's chat line or command (`/` first), sent as the chat box sends it
++    /// (ClientPacketListener.sendChat / sendCommand), with no chat history. An error when the
++    /// player isn't in a server's play state or the Chat option blocks the message.
++    pub(super) fn native_send_chat(&mut self, message: &str) -> Result<(), String> {
++        let Some(remote) = self.remote.as_ref() else {
++            return Err("not connected to a server".into());
++        };
++        // A server that reconfigures the player has them out of the play state.
++        if !remote.joined || remote.reconfiguring.is_some() {
++            return Err("the player has not joined yet".into());
++        }
++        let message = message.trim();
++        if message.is_empty() {
++            return Err("the message is empty".into());
++        }
++        if !self.chat_abilities().allows(message) {
++            return Err("the Chat option blocks this message".into());
++        }
++        self.send_chat(message);
++        Ok(())
++    }
++}
